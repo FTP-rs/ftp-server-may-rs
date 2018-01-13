@@ -208,6 +208,7 @@ impl Client {
             if name.is_none() {
                 self.send(ResultCode::NotLoggedIn, "Unknown user...")
             } else {
+                self.name = name.clone();
                 if pass_required {
                     self.waiting_password = true;
                     self.send(ResultCode::UserNameOkayNeedPassword,
@@ -302,8 +303,8 @@ impl Client {
             if let Ok(prefix) = res {
                 self.cwd = prefix.to_path_buf();
                 prefix_slash(&mut self.cwd);
-                self.send(ResultCode::RequestedFileActionOkay, &format!("Directory changed to \"{}\"",
-                                                             directory.display()))?;
+                return self.send(ResultCode::RequestedFileActionOkay, &format!("Directory changed to \"{}\"",
+                                                             directory.display()));
             }
         }
         self.send(ResultCode::FileNotFound, "No such file or directory")
