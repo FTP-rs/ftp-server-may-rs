@@ -1,21 +1,29 @@
 #[macro_use]
 extern crate may;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate time;
+extern crate toml;
 
 mod cmd;
+mod config;
 mod error;
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::{File, Metadata, create_dir, read_dir, remove_dir_all};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf, StripPrefixError};
+use std::path::{Component, Path, PathBuf, StripPrefixError};
 use std::result;
 use std::str;
 
 use may::net::{TcpListener, TcpStream};
 
 use cmd::{Command, TransferType};
+use config::Config;
+use error::Error;
 
 const CONFIG_FILE: &'static str = "config.toml";
 const MONTHS: [&'static str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -77,10 +85,12 @@ struct Client {
     server_root: PathBuf,
     stream: TcpStream,
     transfer_type: TransferType,
+    config: Config,
+    waiting_password: bool,
 }
 
 impl Client {
-    fn new(stream: TcpStream, server_root: PathBuf) -> Client {
+    fn new(stream: TcpStream, server_root: PathBuf, config: Config) -> Client {
         Client {
             cwd: PathBuf::from("/"),
             data_port: None,
@@ -91,22 +101,39 @@ impl Client {
             server_root,
             stream,
             transfer_type: TransferType::Ascii,
+            config,
+            waiting_password: false,
         }
+    }
+
+    fn is_logged(&self) -> bool {
+        self.name.is_some() && self.waiting_password == false
     }
 
     fn handle_cmd(&mut self, cmd: Command) -> io::Result<()> {
         println!("====> {:?}", cmd);
         match cmd {
             Command::Auth => self.send(ResultCode::CommandNotImplemented, "Not implemented"),
-            Command::Cwd(directory) => self.cwd(directory),
-            Command::List(path) => self.list(path),
+            Command::CdUp if self.is_logged() => {
+                if let Some(path) = self.cwd.parent().map(Path::to_path_buf) {
+                    self.cwd = path;
+                    prefix_slash(&mut self.cwd);
+                }
+                self.send(ResultCode::Ok, "Done")
+            }
+            Command::Cwd(ref directory) if self.is_logged() => self.cwd(directory),
+            Command::List(ref path) if self.is_logged() => self.list(path),
+            Command::Mkd(ref path) if self.is_logged() => self.mkd(path),
             Command::NoOp => self.send(ResultCode::Ok, "Doing nothing"),
-            Command::Pasv => self.pasv(),
-            Command::Port(port) => {
+            Command::Pass(ref content) if self.name.is_some() && self.waiting_password => {
+                self.pass(content)
+            }
+            Command::Pasv if self.is_logged() => self.pasv(),
+            Command::Port(port) if self.is_logged() => {
                 self.data_port = Some(port);
                 self.send(ResultCode::Ok, &format!("Data port is now {}", port))
-            },
-            Command::Pwd => {
+            }
+            Command::Pwd if self.is_logged() => {
                 let msg = format!("{}", self.cwd.to_str().unwrap_or("")); // small trick
                 if !msg.is_empty() {
                     let message = format!("\"{}\" ", msg);
@@ -116,26 +143,90 @@ impl Client {
                 }
             }
             Command::Quit => self.quit(),
+            Command::Retr(ref file) if self.is_logged() => self.retr(file),
+            Command::Rmd(ref path) if self.is_logged() => self.rmd(path),
+            Command::Stor(ref file) if self.is_logged() => self.stor(file),
             Command::Syst => self.send(ResultCode::Ok, "I won't tell"),
             Command::Type(typ) => {
                 self.transfer_type = typ;
                 self.send(ResultCode::Ok, "Transfer type changed successfully")
-            },
-            Command::User(username) => {
-                if username.is_empty() {
-                    self.send(ResultCode::InvalidParameterOrArgument, "Invalid username")
-                } else {
-                    self.name = Some(username.to_owned());
-                    self.send(ResultCode::UserLoggedIn, &format!("Welcome {}!", username))
-                }
-            },
-            s => self.send(ResultCode::UnknownCommand, &format!("Not implemented: '{:?}'", s)),
+            }
+            Command::Unknown(s) => self.send(ResultCode::UnknownCommand,
+                                             &format!("Not implemented: '{:?}'", s)),
+            Command::User(ref content) => self.user(content),
+            _ => self.send(ResultCode::NotLoggedIn, "Please log first"),
         }
     }
 
-    fn list(&mut self, path: Option<PathBuf>) -> io::Result<()> {
+    fn pass(&mut self, content: &str) -> io::Result<()> {
+        let mut ok = false;
+        if self.is_admin {
+            ok = *content == self.config.admin.as_ref().unwrap().password;
+        } else {
+            for user in &self.config.users {
+                if Some(&user.name) == self.name.as_ref() {
+                    if user.password == *content {
+                        ok = true;
+                        break
+                    }
+                }
+            }
+        }
+        if ok {
+            self.waiting_password = false;
+            let name = self.name.clone().unwrap_or(String::new());
+            self.send(ResultCode::UserLoggedIn, &format!("Welcome {}", name))
+        } else {
+            self.send(ResultCode::NotLoggedIn, "Invalid password")
+        }
+    }
+
+    fn user(&mut self, content: &str) -> io::Result<()> {
+        if content.is_empty() {
+            self.send(ResultCode::InvalidParameterOrArgument, "Invalid username")
+        } else {
+            let mut name = None;
+            let mut pass_required = true;
+
+            self.is_admin = false;
+            if let Some(ref admin) = self.config.admin {
+                if admin.name == content {
+                    name = Some(content.to_owned());
+                    pass_required = admin.password.is_empty() == false;
+                    self.is_admin = true;
+                }
+            }
+            if name.is_none() {
+                for user in &self.config.users {
+                    if user.name == content {
+                        name = Some(content.to_owned());
+                        pass_required = user.password.is_empty() == false;
+                        break;
+                    }
+                }
+            }
+            if name.is_none() {
+                self.send(ResultCode::NotLoggedIn, "Unknown user...")
+            } else {
+                if pass_required {
+                    self.waiting_password = true;
+                    self.send(ResultCode::UserNameOkayNeedPassword,
+                              &format!("Login OK, password needed for {}", content))
+                } else {
+                    self.waiting_password = false;
+                    self.send(ResultCode::UserLoggedIn, &format!("Welcome {}!", content))
+                }
+            }
+        }
+    }
+
+    fn list(&mut self, path: &Option<PathBuf>) -> io::Result<()> {
         if self.data_stream.is_some() {
-            let path = self.cwd.join(path.unwrap_or_default());
+            let x = Default::default();
+            let path = match *path {
+                Some(ref p) => p,
+                None => &x,
+            };
             let directory = PathBuf::from(&path);
             let res = self.complete_path(directory);
             if let Ok(path) = res {
@@ -203,7 +294,7 @@ impl Client {
         Ok(())
     }
 
-    fn cwd(&mut self, directory: PathBuf) -> io::Result<()> {
+    fn cwd(&mut self, directory: &PathBuf) -> io::Result<()> {
         let path = self.cwd.join(&directory);
         let res = self.complete_path(path);
         if let Ok(dir) = res {
@@ -231,6 +322,37 @@ impl Client {
             }
         }
         dir
+    }
+
+    fn mkd(&mut self, path: &PathBuf) -> io::Result<()> {
+        let path = self.cwd.join(&path);
+        let parent = get_parent(path.clone());
+        if let Some(parent) = parent {
+            let parent = parent.to_path_buf();
+            if let Ok(mut dir) = self.complete_path(parent) {
+                if dir.is_dir() {
+                    if let Some(filename) = get_filename(path) {
+                        dir.push(filename);
+                        if create_dir(dir).is_ok() {
+                            return self.send(ResultCode::PATHNAMECreated,
+                                             "Folder successfully created!");
+                        }
+                    }
+                }
+            }
+        }
+        self.send(ResultCode::FileNotFound, "Couldn't create folder")
+    }
+
+    fn rmd(&mut self, directory: &PathBuf) -> io::Result<()> {
+        let path = self.cwd.join(&directory);
+        if let Ok(dir) = self.complete_path(path) {
+            if remove_dir_all(dir).is_ok() {
+                return self.send(ResultCode::RequestedFileActionOkay,
+                                 "Folder successfully removed");
+            }
+        }
+        self.send(ResultCode::FileNotFound, "Couldn't remove folder")
     }
 
     fn strip_prefix(&self, dir: PathBuf) -> result::Result<PathBuf, StripPrefixError> {
@@ -274,6 +396,76 @@ impl Client {
         }
         Ok(())
     }
+
+    fn retr(&mut self, path: &PathBuf) -> io::Result<()> {
+        // TODO: check if multiple data connection can be opened at the same time.
+        if self.data_stream.is_some() {
+            let path = self.cwd.join(path);
+            if let Ok(path) = self.complete_path(path.clone()) { // TODO: still ugly clone
+                if path.is_file() && (self.is_admin || path != self.server_root.join(CONFIG_FILE)) {
+                    self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file...")?;
+                    let mut file = File::open(path)?;
+                    let mut out = vec![];
+                    // TODO: send the file chunck by chunck if it is big (if needed).
+                    file.read_to_end(&mut out)?;
+                    self.send_data(out)?;
+                    println!("-> file transfer done!");
+                } else {
+                    match path.to_str().ok_or_else(|| Error::Msg("No path".to_string())) {
+                        Ok(p) => self.send(ResultCode::LocalErrorInProcessing,
+                                           &format!("\"{}\" doesn't exist", p)),
+                        Err(_) => self.send(ResultCode::LocalErrorInProcessing,
+                                            "path doesn't exist"),
+                    }?;
+                }
+            } else {
+                match path.to_str().ok_or_else(|| Error::Msg("No path".to_string())) {
+                    Ok(p) => self.send(ResultCode::LocalErrorInProcessing,
+                                       &format!("\"{}\" doesn't exist", p)),
+                    Err(_) => self.send(ResultCode::LocalErrorInProcessing,
+                                        "path doesn't exist"),
+                }?;
+            }
+        } else {
+            self.send(ResultCode::ConnectionClosed, "No opened data connection")?;
+        }
+        if self.data_stream.is_some() {
+            self.close_data_connection();
+            self.send(ResultCode::ClosingDataConnection, "Transfer done")?;
+        }
+        Ok(())
+    }
+
+    fn stor(&mut self, path: &PathBuf) -> io::Result<()> {
+        if self.data_stream.is_some() {
+            if invalid_path(path) ||
+               (!self.is_admin && *path == self.server_root.join(CONFIG_FILE)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let path = self.cwd.join(path);
+            self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file...")?;
+            let data = self.receive_data()?;
+            let mut file = File::create(path)?;
+            file.write_all(&data)?;
+            println!("-> file transfer done!");
+            self.close_data_connection();
+            self.send(ResultCode::ClosingDataConnection, "Transfer done")
+        } else {
+            self.send(ResultCode::ConnectionClosed, "No opened data connection")
+        }
+    }
+
+    fn receive_data(&mut self) -> io::Result<Vec<u8>> {
+        // NOTE: have to use this weird trick because of futures-await.
+        // TODO: fix that when the lifetime stuff is improved for generators.
+        Ok(if let Some(ref mut data_stream) = self.data_stream {
+            let mut file_data = vec![];
+            data_stream.read_to_end(&mut file_data)?;
+            file_data
+        } else {
+            vec![]
+        })
+    }
 }
 
 fn read_all_message(stream: &mut TcpStream) -> Vec<u8> {
@@ -309,24 +501,26 @@ fn send_cmd(stream: &mut TcpStream, code: ResultCode, message: &str) -> io::Resu
     write!(stream, "{}", msg)
 }
 
-fn handle_client(mut stream: TcpStream, server_root: PathBuf) -> io::Result<()> {
+fn handle_client(mut stream: TcpStream, server_root: PathBuf, config: Config) -> io::Result<()> {
     println!("new client connected!");
     send_cmd(&mut stream, ResultCode::ServiceReadyForNewUser, "Welcome to this FTP server!")?;
-    let mut client = Client::new(stream, server_root);
+    let mut client = Client::new(stream, server_root, config);
     client.run()
 }
 
 fn server() -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:1234")?;
     let server_root = env::current_dir()?;
+    let config = Config::new(CONFIG_FILE).expect("Error while loading config...");
 
     println!("Waiting for clients to connect...");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let server_root = server_root.clone();
+                let config = config.clone();
                 go!(|| {
-                    if let Err(error) = handle_client(stream, server_root) {
+                    if let Err(error) = handle_client(stream, server_root, config) {
                         println!("Error handling client: {}", error)
                     }
                 });
@@ -402,4 +596,21 @@ fn get_file_info(meta: &Metadata) -> (time::Tm, u64) {
 fn get_file_info(meta: &Metadata) -> (time::Tm, u64) {
     use std::os::unix::prelude::*;
     (time::at(time::Timespec::new(meta.mtime(), 0)), meta.size())
+}
+
+fn get_parent(path: PathBuf) -> Option<PathBuf> {
+    path.parent().map(|p| p.to_path_buf())
+}
+
+fn get_filename(path: PathBuf) -> Option<OsString> {
+    path.file_name().map(|p| p.to_os_string())
+}
+
+fn invalid_path(path: &Path) -> bool {
+    for component in path.components() {
+        if let Component::ParentDir = component {
+            return true;
+        }
+    }
+    false
 }
