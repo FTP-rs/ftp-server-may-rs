@@ -3,3 +3,4 @@ name = "ftp-serveur-may"
 version = "0.0.1"
 
 [dependencies]
+may = "^0.2.0"

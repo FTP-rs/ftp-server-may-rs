@@ -1,8 +1,11 @@
-use std::net::{TcpListener, TcpStream};
-use std::thread;
+#[macro_use]
+extern crate may;
+
 use std::str;
 use std::path::PathBuf;
 use std::io::{self, Read, Write};
+
+use may::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
@@ -191,7 +194,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || {
+                go!(|| {
                     handle_client(stream);
                 });
             }
