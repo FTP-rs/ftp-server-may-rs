@@ -1,0 +1,5 @@
+[package]
+name = "ftp-serveur-may"
+version = "0.0.1"
+
+[dependencies]
